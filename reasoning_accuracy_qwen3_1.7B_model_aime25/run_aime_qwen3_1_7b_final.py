@@ -3,19 +3,25 @@ import json
 import torch
 import re
 from tqdm import tqdm
+from collections import Counter
 from datasets import load_dataset
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
 # =========================
-# CONFIG
+# CONFIG (PAPER SETTINGS)
 # =========================
 
 MODEL_NAME = "Qwen/Qwen3-1.7B"
 DEVICE = "cuda:0"
 
-MAX_NEW_TOKENS = 16384   # full reasoning budget
+MAX_NEW_TOKENS = 16384   # paper AIME setting
+NUM_SAMPLES = 8         # CRITICAL (paper)
 
-OUTPUT_FILE = "outputs/aime_2025_qwen3_reasoning.jsonl"
+TEMPERATURE = 0.6
+TOP_P = 0.95
+TOP_K = 20
+
+OUTPUT_FILE = "outputs/aime_2025_qwen3_paper.jsonl"
 
 os.makedirs("outputs", exist_ok=True)
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -25,17 +31,17 @@ torch.backends.cuda.matmul.allow_tf32 = True
 # =========================
 
 def extract_answer(text):
-    # boxed answer (strict)
+    # boxed
     boxed = re.findall(r"\\boxed\{\s*(\d+)\s*\}", text)
     if boxed:
         return boxed[-1]
 
-    # "answer is X"
+    # "answer is"
     match = re.search(r"[Tt]he answer is\s*(\d+)", text)
     if match:
         return match.group(1)
 
-    # last number fallback (AIME safe)
+    # fallback (AIME safe)
     nums = re.findall(r"\b\d{1,3}\b", text)
     if nums:
         return nums[-1]
@@ -73,7 +79,7 @@ dataset = load_dataset("MathArena/aime_2025", split="train")
 print(f"Total problems: {len(dataset)}")
 
 # =========================
-# RESUME
+# RESUME SUPPORT
 # =========================
 
 completed = 0
@@ -96,12 +102,11 @@ for idx, item in enumerate(tqdm(dataset)):
     question = item["problem"]
     gt_answer = str(item["answer"]).strip()
 
-    # 🔥 PURE REASONING PROMPT (no early stop instructions)
+    # PAPER-STYLE PROMPT (NO STOPPING INSTRUCTIONS)
     prompt = f"""Solve the following AIME problem.
 
-You must reason step by step carefully and completely.
-Do not stop early.
-At the end, give the final answer in the format \\boxed{{integer}}.
+Show full reasoning before giving the final answer.
+Give the final answer in the form \\boxed{{integer}}.
 
 Problem:
 {question}
@@ -109,40 +114,58 @@ Problem:
 Solution:
 """
 
-    inputs = tokenizer(
-        prompt,
-        return_tensors="pt"
-    ).to(DEVICE)
+    inputs = tokenizer(prompt, return_tensors="pt").to(DEVICE)
 
-    with torch.no_grad():
-        output = model.generate(
-            **inputs,
-            max_new_tokens=MAX_NEW_TOKENS,
-            do_sample=False,  # 🔥 IMPORTANT: deterministic reasoning
-            temperature=0.0,
-            pad_token_id=tokenizer.eos_token_id,
-        )
+    all_preds = []
+    all_outputs = []
 
-    generated_ids = output[0]
-    input_len = inputs["input_ids"].shape[-1]
+    for _ in range(NUM_SAMPLES):
 
-    # SAFE DECODE
-    if len(generated_ids) > input_len:
-        text = tokenizer.decode(
-            generated_ids[input_len:],
-            skip_special_tokens=True
-        )
+        with torch.no_grad():
+            output = model.generate(
+                **inputs,
+                max_new_tokens=MAX_NEW_TOKENS,
+                do_sample=True,
+                temperature=TEMPERATURE,
+                top_p=TOP_P,
+                top_k=TOP_K,
+                pad_token_id=tokenizer.eos_token_id,
+            )
+
+        generated_ids = output[0]
+        input_len = inputs["input_ids"].shape[-1]
+
+        if len(generated_ids) > input_len:
+            text = tokenizer.decode(
+                generated_ids[input_len:],
+                skip_special_tokens=True
+            )
+        else:
+            text = ""
+
+        pred = extract_answer(text)
+
+        if pred is not None:
+            all_preds.append(pred)
+
+        all_outputs.append(text)
+
+    # =========================
+    # MAJORITY VOTE (CRITICAL)
+    # =========================
+
+    if all_preds:
+        final_pred = Counter(all_preds).most_common(1)[0][0]
     else:
-        text = ""
-
-    pred = extract_answer(text)
+        final_pred = None
 
     result = {
         "id": idx,
         "question": question,
         "ground_truth": gt_answer,
-        "model_output": text,
-        "predicted_answer": pred
+        "predicted_answer": final_pred,
+        "all_predictions": all_preds,
+        "num_valid_samples": len(all_preds)
     }
 
     with open(OUTPUT_FILE, "a") as f:
