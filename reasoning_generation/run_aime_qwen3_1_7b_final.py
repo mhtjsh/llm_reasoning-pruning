@@ -8,40 +8,37 @@ from datasets import load_dataset
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
 # =========================
-# CONFIG (PAPER SETTINGS)
+# CONFIG (PAPER-ALIGNED)
 # =========================
 
 MODEL_NAME = "Qwen/Qwen3-1.7B"
 DEVICE = "cuda:0"
 
-MAX_NEW_TOKENS = 16384   # paper AIME setting
-NUM_SAMPLES = 8         # CRITICAL (paper)
+MAX_NEW_TOKENS = 16384   # your constraint
+NUM_SAMPLES = 8          # your requirement
 
 TEMPERATURE = 0.6
 TOP_P = 0.95
 TOP_K = 20
 
-OUTPUT_FILE = "outputs/aime_2025_qwen3_paper.jsonl"
+OUTPUT_FILE = "outputs/aime_qwen3_think_template.jsonl"
 
 os.makedirs("outputs", exist_ok=True)
 torch.backends.cuda.matmul.allow_tf32 = True
 
 # =========================
-# ANSWER EXTRACTION
+# EXTRACTION
 # =========================
 
 def extract_answer(text):
-    # boxed
     boxed = re.findall(r"\\boxed\{\s*(\d+)\s*\}", text)
     if boxed:
         return boxed[-1]
 
-    # "answer is"
     match = re.search(r"[Tt]he answer is\s*(\d+)", text)
     if match:
         return match.group(1)
 
-    # fallback (AIME safe)
     nums = re.findall(r"\b\d{1,3}\b", text)
     if nums:
         return nums[-1]
@@ -50,16 +47,26 @@ def extract_answer(text):
 
 
 # =========================
+# SPLIT THINK / ANSWER (POST ONLY)
+# =========================
+
+def split_think_answer(text):
+    match = re.search(r"<think>(.*?)</think>", text, re.DOTALL)
+    if match:
+        think = match.group(1).strip()
+        answer = text[match.end():].strip()
+        return think, answer
+
+    return "", text
+
+
+# =========================
 # LOAD MODEL
 # =========================
 
-print("Loading tokenizer...")
-tokenizer = AutoTokenizer.from_pretrained(
-    MODEL_NAME,
-    trust_remote_code=True
-)
-
 print("Loading model...")
+tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
+
 model = AutoModelForCausalLM.from_pretrained(
     MODEL_NAME,
     torch_dtype=torch.bfloat16,
@@ -73,51 +80,29 @@ model.eval()
 # LOAD DATASET
 # =========================
 
-print("Loading AIME 2025 dataset...")
 dataset = load_dataset("MathArena/aime_2025", split="train")
 
-print(f"Total problems: {len(dataset)}")
-
 # =========================
-# RESUME SUPPORT
-# =========================
-
-completed = 0
-
-if os.path.exists(OUTPUT_FILE):
-    with open(OUTPUT_FILE) as f:
-        completed = sum(1 for _ in f)
-
-print(f"Resuming from {completed}")
-
-# =========================
-# GENERATION LOOP
+# LOOP
 # =========================
 
 for idx, item in enumerate(tqdm(dataset)):
 
-    if idx < completed:
-        continue
-
     question = item["problem"]
     gt_answer = str(item["answer"]).strip()
 
-    # PAPER-STYLE PROMPT (NO STOPPING INSTRUCTIONS)
-    prompt = f"""Solve the following AIME problem.
-
-Show full reasoning before giving the final answer.
-Give the final answer in the form \\boxed{{integer}}.
-
-Problem:
-{question}
-
-Solution:
+    # 🔥 EXACT QWEN TEMPLATE (CRITICAL)
+    prompt = f"""<|im_start|>user
+{question} /think
+<|im_end|>
+<|im_start|>assistant
+<think>
 """
 
     inputs = tokenizer(prompt, return_tensors="pt").to(DEVICE)
 
     all_preds = []
-    all_outputs = []
+    samples = []
 
     for _ in range(NUM_SAMPLES):
 
@@ -137,21 +122,28 @@ Solution:
 
         if len(generated_ids) > input_len:
             text = tokenizer.decode(
-                generated_ids[input_len:],
-                skip_special_tokens=True
+                generated_ids[input_len:], skip_special_tokens=True
             )
         else:
             text = ""
 
-        pred = extract_answer(text)
+        full_output = "<think>\n" + text  # reconstruct full structure
 
-        if pred is not None:
+        think, answer_text = split_think_answer(full_output)
+        pred = extract_answer(full_output)
+
+        if pred:
             all_preds.append(pred)
 
-        all_outputs.append(text)
+        samples.append({
+            "full_output": full_output,
+            "thinking": think,
+            "answer_text": answer_text,
+            "predicted_answer": pred
+        })
 
     # =========================
-    # MAJORITY VOTE (CRITICAL)
+    # MAJORITY VOTE
     # =========================
 
     if all_preds:
@@ -164,14 +156,12 @@ Solution:
         "question": question,
         "ground_truth": gt_answer,
         "predicted_answer": final_pred,
-        "all_predictions": all_preds,
-        "num_valid_samples": len(all_preds)
+        "samples": samples
     }
 
     with open(OUTPUT_FILE, "a") as f:
         json.dump(result, f)
         f.write("\n")
-        f.flush()
 
 # =========================
 # EVALUATION
@@ -192,5 +182,5 @@ with open(OUTPUT_FILE) as f:
 print("\n=======================")
 print("Total:", total)
 print("Correct:", correct)
-print("Accuracy:", correct / total if total > 0 else 0)
+print("Accuracy:", correct / total if total else 0)
 print("=======================")
